@@ -1,0 +1,427 @@
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity 0.8.23;
+
+// Internal Dependencies
+import {Module_v1} from "src/modules/base/Module_v1.sol";
+import {IFundingManager_v1} from "@fm/IFundingManager_v1.sol";
+import {IBondingCurveBase_v1} from
+    "@fm/bondingCurve/interfaces/IBondingCurveBase_v1.sol";
+
+// External Interfaces
+import {IERC20Issuance_v1} from
+    "@fm/bondingCurve/interfaces/IERC20Issuance_v1.sol";
+import {IERC20} from "@oz/token/ERC20/IERC20.sol";
+
+// External Libraries
+import {SafeERC20} from "@oz/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title   Bonding Curve Funding Manager Base
+ *
+ * @notice  Manages the issuance of token for collateral along a bonding curve in the
+ *          Inverter Network, including fee handling and sell functionality control.
+ *
+ * @dev     Provides core functionalities for issuance operations, fee adjustments,
+ *          and issuance calculations.
+ *          Fee calculations utilize BPS for precision. Issuance-specific calculations should be
+ *          implemented in derived contracts.
+ *
+ * @custom:security-contact security@inverter.network
+ *                          In case of any concerns or findings, please refer to our Security Policy
+ *                          at security.inverter.network or email us directly!
+ *
+ * @author  Inverter Network
+ */
+abstract contract BondingCurveBase_v1 is IBondingCurveBase_v1, Module_v1 {
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        virtual
+        override(Module_v1)
+        returns (bool)
+    {
+        return interfaceId == type(IBondingCurveBase_v1).interfaceId
+            || super.supportsInterface(interfaceId);
+    }
+
+    using SafeERC20 for IERC20Issuance_v1;
+    using SafeERC20 for IERC20;
+
+    //--------------------------------------------------------------------------
+    // Storage
+
+    /// @dev Base Points used for percentage calculation. This value represents 100%
+    uint internal constant BPS = 10_000;
+
+    /// @dev The token the Curve will mint and burn from
+    IERC20Issuance_v1 internal issuanceToken;
+
+    /// @dev Indicates whether the buy functionality is open or not.
+    ///      Enabled = true || disabled = false.
+    bool public buyIsOpen;
+    /// @dev Buy fee expressed in base points, i.e. 0% = 0; 1% = 100; 10% = 1000
+    uint public buyFee;
+
+    /// @notice Accumulated project trading fees collected from deposits made by users
+    /// when engaging with the bonding curve-based funding manager. Collected in collateral
+    uint public projectCollateralFeeCollected;
+
+    // Storage gap for future upgrades
+    uint[50] private __gap;
+
+    //--------------------------------------------------------------------------
+    // Modifiers
+
+    modifier buyingIsEnabled() {
+        _checkBuyIsEnabled();
+        _;
+    }
+
+    /// @dev Modifier to guarantee token recipient is valid.
+    modifier validReceiver(address _receiver) {
+        _validateRecipient(_receiver);
+        _;
+    }
+
+    //--------------------------------------------------------------------------
+    // Public Functions
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function buyFor(address _receiver, uint _depositAmount, uint _minAmountOut)
+        public
+        virtual
+        buyingIsEnabled
+        validReceiver(_receiver)
+    {
+        _buyOrder(_receiver, _depositAmount, _minAmountOut);
+    }
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function buy(uint _depositAmount, uint _minAmountOut) public virtual {
+        buyFor(_msgSender(), _depositAmount, _minAmountOut);
+    }
+
+    //--------------------------------------------------------------------------
+    // OnlyOrchestrator Functions
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function openBuy() external virtual onlyOrchestratorAdmin {
+        buyIsOpen = true;
+        emit BuyingEnabled();
+    }
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function closeBuy() external virtual onlyOrchestratorAdmin {
+        buyIsOpen = false;
+        emit BuyingDisabled();
+    }
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function setBuyFee(uint _fee) external virtual onlyOrchestratorAdmin {
+        _setBuyFee(_fee);
+    }
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function calculatePurchaseReturn(uint _depositAmount)
+        public
+        view
+        virtual
+        returns (uint mintAmount)
+    {
+        _validateDepositAmount(_depositAmount);
+        // Get protocol fee percentages
+        (
+            /* collateralreasury */
+            ,
+            /* issuanceTreasury */
+            ,
+            uint collateralBuyFeePercentage,
+            uint issuanceBuyFeePercentage
+        ) = _getFunctionFeesAndTreasuryAddresses(
+            bytes4(keccak256(bytes("_buyOrder(address, uint, uint)")))
+        );
+
+        // Deduct protocol and project buy fee from collateral, if applicable
+        (_depositAmount, /* protocolFeeAmount */, /* workflowFeeAmount */ ) =
+        _calculateNetAndSplitFees(
+            _depositAmount, collateralBuyFeePercentage, buyFee
+        );
+
+        // Get issuance token return from formula and deduct protocol buy fee, if applicable
+        (mintAmount, /* protocolFeeAmount */, /* workflowFeeAmount */ ) =
+        _calculateNetAndSplitFees(
+            _issueTokensFormulaWrapper(_depositAmount),
+            issuanceBuyFeePercentage,
+            0
+        );
+
+        // Return expected purchase return amount
+        // return mintAmount;
+    }
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function withdrawProjectCollateralFee(address _receiver, uint _amount)
+        public
+        virtual
+        validReceiver(_receiver)
+        onlyOrchestratorAdmin
+    {
+        if (_amount > projectCollateralFeeCollected) {
+            revert Module__BondingCurveBase__InvalidWithdrawAmount();
+        }
+
+        projectCollateralFeeCollected -= _amount;
+
+        __Module_orchestrator.fundingManager().token().safeTransfer(
+            _receiver, _amount
+        );
+
+        emit ProjectCollateralFeeWithdrawn(_receiver, _amount);
+    }
+
+    //--------------------------------------------------------------------------
+    // Public Functions
+
+    /// @notice Returns the address of the issuance token
+    function getIssuanceToken() external view virtual returns (address) {
+        return address(issuanceToken);
+    }
+
+    //--------------------------------------------------------------------------
+    // Public Functions Implemented in Downstream Contract
+
+    /// @inheritdoc IBondingCurveBase_v1
+    function getStaticPriceForBuying() external view virtual returns (uint);
+
+    //--------------------------------------------------------------------------
+    // Internal Functions Implemented in Downstream Contract
+
+    /// @dev Function used for wrapping the call to the external contract responsible for
+    /// calculating the issuing amount. This function is an abstract function and must be
+    /// implemented in the downstream contract.
+    /// @param _depositAmount The amount of collateral token that is deposited
+    /// @return uint Return the amount of tokens to be issued
+    function _issueTokensFormulaWrapper(uint _depositAmount)
+        internal
+        view
+        virtual
+        returns (uint);
+
+    //--------------------------------------------------------------------------
+    // Internal Functions
+
+    /// @dev Internal function to handle the buying of tokens.
+    /// This function performs the core logic for buying tokens. It transfers the collateral,
+    /// deducts any applicable fees, and mints new tokens for the buyer.
+    /// @param _receiver The address that will receive the bought tokens.
+    /// @param _depositAmount The amount of collateral to deposit for buying tokens.
+    /// @param _minAmountOut The minimum acceptable amount the user expects to receive from the transaction.
+    /// @return totalIssuanceTokenMinted The total amount of issuance token minted during this function call
+    /// @return collateralFeeAmount The amount of collateral token subtracted as fee
+    function _buyOrder(
+        address _receiver,
+        uint _depositAmount,
+        uint _minAmountOut
+    )
+        internal
+        returns (uint totalIssuanceTokenMinted, uint collateralFeeAmount)
+    {
+        _validateDepositAmount(_depositAmount);
+
+        // Cache Collateral Token
+        IERC20 collateralToken = __Module_orchestrator.fundingManager().token();
+
+        // Transfer collateral, confirming that correct amount == allowance
+        collateralToken.safeTransferFrom(
+            _msgSender(), address(this), _depositAmount
+        );
+        // Get protocol fee percentages and treasury addresses
+        (
+            address collateralTreasury,
+            address issuanceTreasury,
+            uint collateralBuyFeePercentage,
+            uint issuanceBuyFeePercentage
+        ) = _getFunctionFeesAndTreasuryAddresses(
+            bytes4(keccak256(bytes("_buyOrder(address, uint, uint)")))
+        );
+
+        // Get net amount, protocol and workflow fee amounts
+        (uint netDeposit, uint protocolFeeAmount, uint workflowFeeAmount) =
+        _calculateNetAndSplitFees(
+            _depositAmount, collateralBuyFeePercentage, buyFee
+        );
+
+        // collateral Fee Amount is the combination of protocolFeeAmount plus the workflowFeeAmount
+        collateralFeeAmount = protocolFeeAmount + workflowFeeAmount;
+
+        // Process the protocol fee
+        _processProtocolFeeViaTransfer(
+            collateralTreasury, collateralToken, protocolFeeAmount
+        );
+
+        // Add workflow fee if applicable
+        if (workflowFeeAmount > 0) {
+            projectCollateralFeeCollected += workflowFeeAmount;
+        }
+
+        // Calculate mint amount based on upstream formula
+        uint issuanceMintAmount = _issueTokensFormulaWrapper(netDeposit);
+        totalIssuanceTokenMinted = issuanceMintAmount;
+
+        // Get net amount, protocol and workflow fee amounts. Currently there is no issuance project
+        // fee enabled
+        (issuanceMintAmount, protocolFeeAmount, /* workflowFeeAmount */ ) =
+        _calculateNetAndSplitFees(
+            issuanceMintAmount, issuanceBuyFeePercentage, 0
+        );
+        // collect protocol fee on outgoing issuance token
+        _processProtocolFeeViaMinting(issuanceTreasury, protocolFeeAmount);
+
+        // Revert when the mint amount is lower than minimum amount the user expects
+        if (issuanceMintAmount < _minAmountOut) {
+            revert Module__BondingCurveBase__InsufficientOutputAmount();
+        }
+        // Mint tokens to address
+        _mint(_receiver, issuanceMintAmount);
+        // Emit event
+        emit TokensBought(
+            _receiver, _depositAmount, issuanceMintAmount, _msgSender()
+        );
+    }
+
+    /// @dev Sets the buy transaction fee, expressed in BPS.
+    /// @param _fee The fee percentage to set for buy transactions.
+    function _setBuyFee(uint _fee) internal virtual {
+        _validateWorkflowFee(_fee);
+        emit BuyFeeUpdated(_fee, buyFee);
+        buyFee = _fee;
+    }
+
+    /// @dev Returns the collateral and issuance fee percentage retrieved from the fee manager for
+    ///     a specific operation
+    /// @return collateralTreasury The address the protocol fee in collateral should be sent to
+    /// @return issuanceTreasury The address the protocol fee in issuance should be sent to
+    /// @return collateralFeePercentage The percentage fee to be collected from the collateral
+    ///     token being deposited or redeemed, expressed in BPS
+    /// @return issuanceFeePercentage The percentage fee to be collected from the issuance token
+    ///     being deposited or minted, expressed in BPS
+    function _getFunctionFeesAndTreasuryAddresses(bytes4 _selector)
+        internal
+        view
+        virtual
+        returns (
+            address collateralTreasury,
+            address issuanceTreasury,
+            uint collateralFeePercentage,
+            uint issuanceFeePercentage
+        )
+    {
+        (collateralFeePercentage, collateralTreasury) =
+            _getFeeManagerCollateralFeeData(_selector);
+        (issuanceFeePercentage, issuanceTreasury) =
+            _getFeeManagerIssuanceFeeData(_selector);
+    }
+
+    /// @dev Calculates the propotion of the fees for the given amount and returns them plus the amount minus the fees
+    /// @param _totalAmount The amount from which the fees will be taken
+    /// @param _protocolFee The protocol fee percentage in relation to the BPS that will be applied to the totalAmount
+    /// @param _workflowFee The workflow fee percentage in relation to the BPS that will be applied to the totalAmount
+    /// @return netAmount The total amount minus the combined fee amount
+    /// @return protocolFeeAmount The fee amount of the protocol fee
+    /// @return workflowFeeAmount The fee amount of the workflow fee
+
+    function _calculateNetAndSplitFees(
+        uint _totalAmount,
+        uint _protocolFee,
+        uint _workflowFee
+    )
+        internal
+        pure
+        returns (uint netAmount, uint protocolFeeAmount, uint workflowFeeAmount)
+    {
+        if ((_protocolFee + _workflowFee) > BPS) {
+            revert Module__BondingCurveBase__FeeAmountToHigh();
+        }
+        protocolFeeAmount = _totalAmount * _protocolFee / BPS;
+        workflowFeeAmount = _totalAmount * _workflowFee / BPS;
+        netAmount = _totalAmount - protocolFeeAmount - workflowFeeAmount;
+    }
+
+    function _processProtocolFeeViaTransfer(
+        address _treasury,
+        IERC20 _token,
+        uint _feeAmount
+    ) internal {
+        // skip protocol fee collection if fee percentage set to zero
+        if (_feeAmount > 0) {
+            _validateRecipient(_treasury);
+
+            // transfer fee amount
+            _token.safeTransfer(_treasury, _feeAmount);
+            emit ProtocolFeeTransferred(address(_token), _treasury, _feeAmount);
+        }
+    }
+
+    function _processProtocolFeeViaMinting(address _treasury, uint _feeAmount)
+        internal
+    {
+        // skip protocol fee collection if fee percentage set to zero
+        if (_feeAmount > 0) {
+            _validateRecipient(_treasury);
+
+            // mint fee amount
+            _mint(_treasury, _feeAmount);
+            emit ProtocolFeeMinted(address(this), _treasury, _feeAmount);
+        }
+    }
+
+    /// @dev Sets the issuance token for the FundingManager.
+    /// This function updates the `issuanceToken` state variable and should be be overriden by
+    /// the implementation contract if extra validation around the token characteristics is needed.
+    /// @param _issuanceToken The token which will be issued by the Bonding Curve.
+    function _setIssuanceToken(address _issuanceToken) internal virtual {
+        emit IssuanceTokenUpdated(address(issuanceToken), _issuanceToken);
+        issuanceToken = IERC20Issuance_v1(_issuanceToken);
+    }
+
+    function _checkBuyIsEnabled() internal view {
+        if (!buyIsOpen) {
+            revert Module__BondingCurveBase__BuyingFunctionaltiesClosed();
+        }
+    }
+
+    function _validateRecipient(address _receiver) internal view {
+        if (_receiver == address(0) || _receiver == address(this)) {
+            revert Module__BondingCurveBase__InvalidRecipient();
+        }
+    }
+
+    function _validateWorkflowFee(uint _workflowFee) internal pure {
+        if (_workflowFee > BPS) {
+            revert Module__BondingCurveBase__InvalidFeePercentage();
+        }
+    }
+
+    function _validateDepositAmount(uint _depositAmount) internal pure {
+        if (_depositAmount == 0) {
+            revert Module__BondingCurveBase__InvalidDepositAmount();
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Calls to the external ERC20 contract
+
+    /// @dev Mints new tokens
+    /// @param _to The address of the recipient.
+    /// @param _amount The amount of tokens to mint.
+    function _mint(address _to, uint _amount) internal virtual {
+        issuanceToken.mint(_to, _amount);
+    }
+
+    /// @dev Burns tokens
+    /// @param _from The address of the owner.
+    /// @param _amount The amount of tokens to burn.
+    function _burn(address _from, uint _amount) internal virtual {
+        issuanceToken.burn(_from, _amount);
+    }
+}
